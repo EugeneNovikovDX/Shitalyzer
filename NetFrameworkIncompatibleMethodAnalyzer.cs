@@ -132,11 +132,20 @@ namespace Shitalyzer
 
         private static (bool isIncompatible, string? overloadKind, string display) ClassifyRegex(IMethodSymbol method)
         {
-            // Regex.Count (static and instance) was added in .NET 7. Regex.Matches(...).Count is the
-            // .NET Framework spelling - but CA1875 pushes back the other way on a .NET-only project,
-            // so there is no single mechanical rewrite and no code fix is offered.
-            if (method.Name == "Count")
-                return (true, null, "Regex.Count");
+            // All three exist in both a static and an instance form, and none has a .NET Framework
+            // counterpart: Count and EnumerateMatches arrived in .NET 7, EnumerateSplits in .NET 9.
+            // No code fix is offered - the netfx spelling of Count is Regex.Matches(...).Count, but
+            // CA1875 pushes back the other way on a .NET-only project, and the two allocation-free
+            // enumerators have no equivalent at all (Matches/Split return the materialized results).
+            switch (method.Name)
+            {
+                case "Count":
+                    return (true, null, "Regex.Count");
+                case "EnumerateMatches":
+                    return (true, null, "Regex.EnumerateMatches");
+                case "EnumerateSplits":
+                    return (true, null, "Regex.EnumerateSplits");
+            }
 
             return (false, null, string.Empty);
         }
