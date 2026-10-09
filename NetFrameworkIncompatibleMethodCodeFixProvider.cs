@@ -8,6 +8,8 @@ using Microsoft.CodeAnalysis.CodeActions;
 using Microsoft.CodeAnalysis.CodeFixes;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
+using Microsoft.CodeAnalysis.Formatting;
+using Microsoft.CodeAnalysis.Simplification;
 using static Microsoft.CodeAnalysis.CSharp.SyntaxFactory;
 
 namespace Shitalyzer
@@ -20,6 +22,9 @@ namespace Shitalyzer
     /// <item><c>s.EndsWith('a')</c> → <c>(s.Length != 0 &amp;&amp; s[s.Length - 1] == 'a')</c></item>
     /// <item><c>s.Contains('a')</c> → <c>(s.IndexOf('a') >= 0)</c></item>
     /// <item><c>Math.Clamp(v, lo, hi)</c> → <c>Math.Min(Math.Max(v, lo), hi)</c></item>
+    /// <item><c>d.TryAdd(k, v);</c> → <c>if (!d.ContainsKey(k)) d.Add(k, v);</c> (statement form only)</item>
+    /// <item><c>d.Remove(k, out v)</c> → <c>(d.TryGetValue(k, out v) &amp;&amp; d.Remove(k))</c></item>
+    /// <item><c>d.EnsureCapacity(n);</c> / <c>d.TrimExcess();</c> → removed (they are only capacity hints)</item>
     /// </list>
     /// The fix is only offered when the receiver is side-effect free (no nested invocations).
     /// </summary>
@@ -53,6 +58,24 @@ namespace Shitalyzer
             if (overloadKind == NetFrameworkIncompatibleMethodAnalyzer.MathClamp)
             {
                 RegisterMathClampFix(context, invocation, diagnostic);
+                return;
+            }
+
+            if (overloadKind == NetFrameworkIncompatibleMethodAnalyzer.DictionaryTryAdd)
+            {
+                RegisterDictionaryTryAddFix(context, invocation, memberAccess, diagnostic);
+                return;
+            }
+
+            if (overloadKind == NetFrameworkIncompatibleMethodAnalyzer.DictionaryRemoveOut)
+            {
+                RegisterDictionaryRemoveOutFix(context, invocation, memberAccess, diagnostic);
+                return;
+            }
+
+            if (overloadKind == NetFrameworkIncompatibleMethodAnalyzer.CapacityHint)
+            {
+                RegisterCapacityHintFix(context, invocation, memberAccess, diagnostic);
                 return;
             }
 
@@ -104,6 +127,135 @@ namespace Shitalyzer
                     equivalenceKey: DiagnosticIds.NetFrameworkIncompatibleMethod + ":" + NetFrameworkIncompatibleMethodAnalyzer.MathClamp),
                 diagnostic);
         }
+
+        private static void RegisterDictionaryTryAddFix(CodeFixContext context, InvocationExpressionSyntax invocation, MemberAccessExpressionSyntax memberAccess, Diagnostic diagnostic)
+        {
+            // Only the discarded-result form is rewritten; when the bool result is consumed the
+            // surrounding control flow would have to be restructured.
+            if (invocation.Parent is not ExpressionStatementSyntax statement)
+                return;
+
+            // Two arguments means instance/extension call syntax; the static
+            // CollectionExtensions.TryAdd(d, k, v) form is left alone.
+            var arguments = invocation.ArgumentList.Arguments;
+            if (arguments.Count != 2)
+                return;
+
+            var receiver = memberAccess.Expression;
+            var key = arguments[0].Expression;
+
+            // Both the receiver and the key are evaluated twice in the rewrite.
+            if (HasSideEffects(receiver) || HasSideEffects(key))
+                return;
+
+            var bareReceiver = receiver.WithoutTrivia();
+            var bareKey = key.WithoutTrivia();
+            var value = arguments[1].Expression.WithoutTrivia();
+
+            // if (!receiver.ContainsKey(key)) receiver.Add(key, value);
+            var containsKey = InvocationExpression(
+                MemberAccessExpression(SyntaxKind.SimpleMemberAccessExpression, bareReceiver, IdentifierName("ContainsKey")),
+                ArgumentList(SingletonSeparatedList(Argument(bareKey))));
+            var add = ExpressionStatement(
+                InvocationExpression(
+                    MemberAccessExpression(SyntaxKind.SimpleMemberAccessExpression, bareReceiver, IdentifierName("Add")),
+                    ArgumentList(SeparatedList(new[] { Argument(bareKey), Argument(value) }))));
+            var replacement = AsStatementReplacement(statement, IfStatement(PrefixUnaryExpression(SyntaxKind.LogicalNotExpression, containsKey), add));
+
+            context.RegisterCodeFix(
+                CodeAction.Create(
+                    title: "Use ContainsKey/Add instead of TryAdd",
+                    createChangedDocument: ct => ReplaceAsync(context.Document, statement, replacement, ct),
+                    equivalenceKey: DiagnosticIds.NetFrameworkIncompatibleMethod + ":" + NetFrameworkIncompatibleMethodAnalyzer.DictionaryTryAdd),
+                diagnostic);
+        }
+
+        private static void RegisterDictionaryRemoveOutFix(CodeFixContext context, InvocationExpressionSyntax invocation, MemberAccessExpressionSyntax memberAccess, Diagnostic diagnostic)
+        {
+            // Two arguments means instance/extension call syntax; the static
+            // CollectionExtensions.Remove(d, k, out v) form is left alone.
+            var arguments = invocation.ArgumentList.Arguments;
+            if (arguments.Count != 2 || !arguments[1].RefKindKeyword.IsKind(SyntaxKind.OutKeyword))
+                return;
+
+            var receiver = memberAccess.Expression;
+            var key = arguments[0].Expression;
+
+            // Both the receiver and the key are evaluated twice in the rewrite.
+            if (HasSideEffects(receiver) || HasSideEffects(key))
+                return;
+
+            var bareReceiver = receiver.WithoutTrivia();
+            var bareKey = key.WithoutTrivia();
+
+            // TryGetValue always runs, so an 'out var' declared in it is definitely assigned afterwards,
+            // exactly as with Remove(k, out v).
+            var tryGetValue = InvocationExpression(
+                MemberAccessExpression(SyntaxKind.SimpleMemberAccessExpression, bareReceiver, IdentifierName("TryGetValue")),
+                ArgumentList(SeparatedList(new[] { Argument(bareKey), arguments[1].WithoutTrivia() })));
+            var remove = InvocationExpression(
+                MemberAccessExpression(SyntaxKind.SimpleMemberAccessExpression, bareReceiver, IdentifierName("Remove")),
+                ArgumentList(SingletonSeparatedList(Argument(bareKey))));
+
+            SyntaxNode oldNode;
+            SyntaxNode replacement;
+            if (invocation.Parent is ExpressionStatementSyntax statement)
+            {
+                // 'a && b;' is not a valid statement: if (d.TryGetValue(k, out v)) d.Remove(k);
+                oldNode = statement;
+                replacement = AsStatementReplacement(statement, IfStatement(tryGetValue, ExpressionStatement(remove)));
+            }
+            else
+            {
+                oldNode = invocation;
+                replacement = Parenthesize(BinaryExpression(SyntaxKind.LogicalAndExpression, tryGetValue, remove))
+                    .WithAdditionalAnnotations(Simplifier.Annotation);
+            }
+
+            context.RegisterCodeFix(
+                CodeAction.Create(
+                    title: "Use TryGetValue/Remove instead of Remove(key, out value)",
+                    createChangedDocument: ct => ReplaceAsync(context.Document, oldNode, replacement, ct),
+                    equivalenceKey: DiagnosticIds.NetFrameworkIncompatibleMethod + ":" + NetFrameworkIncompatibleMethodAnalyzer.DictionaryRemoveOut),
+                diagnostic);
+        }
+
+        private static void RegisterCapacityHintFix(CodeFixContext context, InvocationExpressionSyntax invocation, MemberAccessExpressionSyntax memberAccess, Diagnostic diagnostic)
+        {
+            // EnsureCapacity/TrimExcess do not change the dictionary's contents, so a standalone call can
+            // simply be dropped. Only offered inside a block, where removing the statement leaves valid code,
+            // and when dropping it does not also drop side effects of its operands.
+            if (invocation.Parent is not ExpressionStatementSyntax { Parent: BlockSyntax } statement)
+                return;
+
+            if (HasSideEffects(memberAccess.Expression) || invocation.ArgumentList.Arguments.Any(a => HasSideEffects(a.Expression)))
+                return;
+
+            context.RegisterCodeFix(
+                CodeAction.Create(
+                    title: $"Remove the {memberAccess.Name.Identifier.ValueText} call (capacity hint only)",
+                    createChangedDocument: ct => RemoveAsync(context.Document, statement, ct),
+                    equivalenceKey: DiagnosticIds.NetFrameworkIncompatibleMethod + ":" + NetFrameworkIncompatibleMethodAnalyzer.CapacityHint),
+                diagnostic);
+        }
+
+        /// <summary>
+        /// Prepares <paramref name="replacement"/> to stand in for <paramref name="statement"/>. As an embedded
+        /// statement (e.g. <c>if (c) d.TryAdd(k, v); else ...</c>) a bare <c>if</c> would capture the outer
+        /// <c>else</c>, so it is wrapped in a block there.
+        /// </summary>
+        private static StatementSyntax AsStatementReplacement(ExpressionStatementSyntax statement, StatementSyntax replacement)
+        {
+            if (statement.Parent is not (BlockSyntax or SwitchSectionSyntax or GlobalStatementSyntax))
+                replacement = Block(replacement);
+
+            return replacement.WithAdditionalAnnotations(Formatter.Annotation);
+        }
+
+        private static bool HasSideEffects(ExpressionSyntax expression) =>
+            expression.DescendantNodesAndSelf().Any(n => n is InvocationExpressionSyntax or ObjectCreationExpressionSyntax or AwaitExpressionSyntax or AssignmentExpressionSyntax
+                || n.IsKind(SyntaxKind.PreIncrementExpression) || n.IsKind(SyntaxKind.PreDecrementExpression)
+                || n.IsKind(SyntaxKind.PostIncrementExpression) || n.IsKind(SyntaxKind.PostDecrementExpression));
 
         private static ExpressionSyntax MathCall(ExpressionSyntax mathReceiver, string method, ExpressionSyntax arg0, ExpressionSyntax arg1) =>
             InvocationExpression(
@@ -170,6 +322,13 @@ namespace Shitalyzer
 
         private static Task<Document> ReplaceAsync(Document document, SyntaxNode oldNode, SyntaxNode newNode, CancellationToken cancellationToken) =>
             ReplaceCoreAsync(document, oldNode, newNode, cancellationToken);
+
+        private static async Task<Document> RemoveAsync(Document document, SyntaxNode node, CancellationToken cancellationToken)
+        {
+            var root = await document.GetSyntaxRootAsync(cancellationToken).ConfigureAwait(false);
+            var newRoot = root?.RemoveNode(node, SyntaxRemoveOptions.KeepUnbalancedDirectives);
+            return newRoot is null ? document : document.WithSyntaxRoot(newRoot);
+        }
 
         private static async Task<Document> ReplaceCoreAsync(Document document, SyntaxNode oldNode, SyntaxNode newNode, CancellationToken cancellationToken)
         {

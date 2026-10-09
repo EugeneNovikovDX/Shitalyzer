@@ -22,6 +22,9 @@ namespace Shitalyzer
         internal const string EndsWithChar = "EndsWithChar";
         internal const string ContainsChar = "ContainsChar";
         internal const string MathClamp = "MathClamp";
+        internal const string DictionaryTryAdd = "DictionaryTryAdd";
+        internal const string DictionaryRemoveOut = "DictionaryRemoveOut";
+        internal const string CapacityHint = "CapacityHint";
 
         /// <summary>
         /// Namespace of the DevExpress compatibility shims. When it is imported, the char/string
@@ -31,6 +34,8 @@ namespace Shitalyzer
         private const string NetCompatibilityExtensionsNamespace = "DevExpress.Data.NetCompatibility.Extensions";
 
         private const string RegexNamespace = "System.Text.RegularExpressions";
+
+        private const string CollectionsGenericNamespace = "System.Collections.Generic";
 
         private static readonly DiagnosticDescriptor Rule = new DiagnosticDescriptor(
             id: DiagnosticIds.NetFrameworkIncompatibleMethod,
@@ -48,7 +53,9 @@ namespace Shitalyzer
             context.EnableConcurrentExecution();
             context.ConfigureGeneratedCodeAnalysis(GeneratedCodeAnalysisFlags.None);
             context.RegisterSyntaxNodeAction(AnalyzeInvocation, SyntaxKind.InvocationExpression);
-            context.RegisterSyntaxNodeAction(AnalyzeObjectCreation, SyntaxKind.ObjectCreationExpression);
+            context.RegisterSyntaxNodeAction(AnalyzeObjectCreation, SyntaxKind.ObjectCreationExpression, SyntaxKind.ImplicitObjectCreationExpression);
+            context.RegisterSyntaxNodeAction(AnalyzeForEachDeconstruction, SyntaxKind.ForEachVariableStatement);
+            context.RegisterSyntaxNodeAction(AnalyzeAssignmentDeconstruction, SyntaxKind.SimpleAssignmentExpression);
         }
 
         private static void AnalyzeInvocation(SyntaxNodeAnalysisContext context)
@@ -86,15 +93,78 @@ namespace Shitalyzer
 
         private static void AnalyzeObjectCreation(SyntaxNodeAnalysisContext context)
         {
-            var creation = (ObjectCreationExpressionSyntax)context.Node;
+            var creation = (BaseObjectCreationExpressionSyntax)context.Node;
 
             if (context.SemanticModel.GetSymbolInfo(creation, context.CancellationToken).Symbol is not IMethodSymbol constructor)
                 return;
 
-            if (!IsIncompatibleType(constructor.ContainingType, out var display))
+            if (!IsIncompatibleType(constructor.ContainingType, out var display)
+                && !IsIncompatibleConstructor(constructor, out display))
                 return;
 
-            context.ReportDiagnostic(Diagnostic.Create(Rule, creation.Type.GetLocation(), display));
+            var location = creation is ObjectCreationExpressionSyntax explicitCreation
+                ? explicitCreation.Type.GetLocation()
+                : creation.NewKeyword.GetLocation();
+
+            context.ReportDiagnostic(Diagnostic.Create(Rule, location, display));
+        }
+
+        /// <summary>
+        /// <c>foreach (var (key, value) in dictionary)</c> binds to <c>KeyValuePair.Deconstruct</c>,
+        /// which only exists on .NET Core.
+        /// </summary>
+        private static void AnalyzeForEachDeconstruction(SyntaxNodeAnalysisContext context)
+        {
+            var statement = (ForEachVariableStatementSyntax)context.Node;
+            var info = context.SemanticModel.GetDeconstructionInfo(statement);
+            ReportIncompatibleDeconstruction(context, info, statement.Variable.GetLocation());
+        }
+
+        /// <summary><c>var (key, value) = pair;</c> and <c>(key, value) = pair;</c>.</summary>
+        private static void AnalyzeAssignmentDeconstruction(SyntaxNodeAnalysisContext context)
+        {
+            var assignment = (AssignmentExpressionSyntax)context.Node;
+            if (assignment.Left is not (TupleExpressionSyntax or DeclarationExpressionSyntax))
+                return;
+
+            var info = context.SemanticModel.GetDeconstructionInfo(assignment);
+            ReportIncompatibleDeconstruction(context, info, assignment.Left.GetLocation());
+        }
+
+        private static void ReportIncompatibleDeconstruction(SyntaxNodeAnalysisContext context, DeconstructionInfo info, Location location)
+        {
+            if (info.Method is { } method && IsKeyValuePairDeconstruct(method))
+            {
+                context.ReportDiagnostic(Diagnostic.Create(Rule, location, "KeyValuePair<TKey, TValue>.Deconstruct"));
+                return;
+            }
+
+            // Nested deconstructions, e.g. foreach (var (i, (key, value)) in ...).
+            foreach (var nested in info.Nested)
+                ReportIncompatibleDeconstruction(context, nested, location);
+        }
+
+        private static bool IsKeyValuePairDeconstruct(IMethodSymbol method) =>
+            method.Name == "Deconstruct"
+            && method.ContainingType is { } type
+            && IsType(type, "KeyValuePair", CollectionsGenericNamespace);
+
+        private static bool IsIncompatibleConstructor(IMethodSymbol constructor, out string display)
+        {
+            // new Dictionary<TKey, TValue>(IEnumerable<KeyValuePair<TKey, TValue>>[, IEqualityComparer<TKey>])
+            // was added in .NET Core 2.0. Passing an IDictionary<TKey, TValue> binds to the older overload.
+            if (IsType(constructor.ContainingType, "Dictionary", CollectionsGenericNamespace)
+                && constructor.Parameters.Length >= 1
+                && constructor.Parameters[0].Type is INamedTypeSymbol { TypeArguments.Length: 1 } first
+                && IsType(first, "IEnumerable", CollectionsGenericNamespace)
+                && IsType(first.TypeArguments[0], "KeyValuePair", CollectionsGenericNamespace))
+            {
+                display = "Dictionary<TKey, TValue>(IEnumerable<KeyValuePair<TKey, TValue>>)";
+                return true;
+            }
+
+            display = string.Empty;
+            return false;
         }
 
         private static bool IsIncompatibleType(INamedTypeSymbol? type, out string display)
@@ -127,6 +197,15 @@ namespace Shitalyzer
             if (IsType(containingType, "Regex", RegexNamespace))
                 return ClassifyRegex(method);
 
+            if (IsType(containingType, "Dictionary", CollectionsGenericNamespace))
+                return ClassifyDictionary(method);
+
+            if (IsType(containingType, "CollectionExtensions", CollectionsGenericNamespace))
+                return ClassifyCollectionExtensions(method);
+
+            if (IsType(containingType, "KeyValuePair", CollectionsGenericNamespace))
+                return ClassifyKeyValuePair(method);
+
             return (false, null, string.Empty);
         }
 
@@ -140,6 +219,53 @@ namespace Shitalyzer
                     return (true, null, "Regex.EnumerateMatches");
                 case "EnumerateSplits":
                     return (true, null, "Regex.EnumerateSplits");
+            }
+
+            return (false, null, string.Empty);
+        }
+
+        private static (bool isIncompatible, string? overloadKind, string display) ClassifyDictionary(IMethodSymbol method)
+        {
+            // Members added to Dictionary<TKey, TValue> in .NET Core 2.0 / 2.1 that .NET Framework lacks.
+            // ConcurrentDictionary lives in another namespace and is not affected.
+            switch (method.Name)
+            {
+                case "TryAdd":
+                    return (true, DictionaryTryAdd, "Dictionary<TKey, TValue>.TryAdd");
+
+                case "Remove" when method.Parameters.Length == 2:
+                    return (true, DictionaryRemoveOut, "Dictionary<TKey, TValue>.Remove(TKey, out TValue)");
+
+                case "EnsureCapacity":
+                case "TrimExcess":
+                    return (true, CapacityHint, $"Dictionary<TKey, TValue>.{method.Name}");
+            }
+
+            return (false, null, string.Empty);
+        }
+
+        private static (bool isIncompatible, string? overloadKind, string display) ClassifyCollectionExtensions(IMethodSymbol method)
+        {
+            // System.Collections.Generic.CollectionExtensions (GetValueOrDefault, TryAdd, Remove, AsReadOnly, …)
+            // does not exist in .NET Framework at all.
+            var overloadKind = method.Name switch
+            {
+                "TryAdd" => DictionaryTryAdd,
+                "Remove" => DictionaryRemoveOut,
+                _ => null,
+            };
+            return (true, overloadKind, $"CollectionExtensions.{method.Name}");
+        }
+
+        private static (bool isIncompatible, string? overloadKind, string display) ClassifyKeyValuePair(IMethodSymbol method)
+        {
+            // The static KeyValuePair.Create helper and KeyValuePair<TKey, TValue>.Deconstruct were added in .NET Core 2.0.
+            switch (method.Name)
+            {
+                case "Create" when method.ContainingType.Arity == 0:
+                    return (true, null, "KeyValuePair.Create");
+                case "Deconstruct":
+                    return (true, null, "KeyValuePair<TKey, TValue>.Deconstruct");
             }
 
             return (false, null, string.Empty);
