@@ -15,8 +15,8 @@ namespace Shitalyzer
         /// <summary>A value-type local is captured/mutated inside a lambda.</summary>
         public const string ValueTypeCapturedInLambda = "SHIT0003";
 
-        /// <summary>An iterator member uses <c>yield</c>, which has no equivalent in the Java output.</summary>
-        public const string YieldNotSupported = "SHIT0004";
+        // SHIT0004 (an iterator using 'yield') is retired: CS2J converts iterators to lazy state machines
+        // (JLazyEnumerator) since dxvcs #50029, 2026-10-06. Do not reuse the id.
 
         /// <summary>A local function (method declared inside a method) has no equivalent in the Java output.</summary>
         public const string LocalFunctionNotSupported = "SHIT0005";
@@ -26,6 +26,12 @@ namespace Shitalyzer
 
         /// <summary>An argument is validated by hand instead of through the <c>Guard</c> helper.</summary>
         public const string ManualArgumentValidation = "SHIT0007";
+
+        /// <summary>A LINQ call passes a comparer to an overload the CS2J Java runtime does not have.</summary>
+        public const string LinqComparerNotSupported = "SHIT0008";
+
+        /// <summary>A LINQ method, or an overload of one, is not implemented by the CS2J Java runtime.</summary>
+        public const string LinqMethodNotSupported = "SHIT0009";
     }
 
     internal static class Categories
