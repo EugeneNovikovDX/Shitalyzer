@@ -32,6 +32,9 @@ namespace Shitalyzer
 
         /// <summary>A LINQ method, or an overload of one, is not implemented by the CS2J Java runtime.</summary>
         public const string LinqMethodNotSupported = "SHIT0009";
+
+        /// <summary>The null-coalescing assignment <c>??=</c>, which the CS2J converter emits verbatim as invalid Java.</summary>
+        public const string CoalesceAssignmentNotSupported = "SHIT0010";
     }
 
     internal static class Categories
